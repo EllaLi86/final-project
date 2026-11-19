@@ -104,7 +104,9 @@ function init() {
 
   setupFilter();
   setupMapHover();
-  new ResizeObserver(() => { layout(); render(); }).observe(document.querySelector(".map-wrap"));
+  setupSeriesClicks();
+  loadAnnual();
+  new ResizeObserver(() => { layout(); buildSeries(); render(); }).observe(document.querySelector(".map-wrap"));
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
 }
 
@@ -265,6 +267,8 @@ function draw() {
   }
   ctx.restore();
   updateAxes();
+  renderMarker();
+
 }
 
 function render() {
@@ -287,6 +291,8 @@ function render() {
     : "";
 
   renderLegend(color);
+  updateSeries();
+
 }
 
 function globalMean(k) {
@@ -341,4 +347,173 @@ function setupMapHover() {
     tip.style.top = Math.max(0, py - 44) + "px";
   });
   canvas.addEventListener("pointerleave", () => { tip.hidden = true; });
+}
+
+// ---------- time series: global mean, click-a-cell, scrub-to-year ----------
+const BASELINE = [1850, 1879];                    // anomalies are relative to this period
+const SM = { top: 24, right: 12, bottom: 22, left: 46 };
+const ANNUAL_SCALE = 500, ANNUAL_FILL = -32768;   // sst_annual.bin: int16, value / 500 = °C, -32768 = land
+let series = null;
+let annual = null;        // Int16Array (years × 97 × 180), 2°×2° cells; null until loaded
+let selCell = null;       // { I, J } index into the 2° grid, or null = global mean
+
+// Loaded in the background; the size check waits until the map's grid (nx, ny) is known.
+const annualBuf = fetch("data/sst_annual.bin").then((r) => r.arrayBuffer());
+function loadAnnual() {
+  annualBuf.then((buf) => {
+    const a = new Int16Array(buf);
+    annual = a.length === meta.global_mean_sst.length * (nx >> 1) * (ny >> 1) ? a : null;
+    if (!annual) console.warn("sst_annual.bin does not match the map grid; click-a-cell is disabled");
+  }).catch((err) => console.error(err));
+}
+
+
+function anomalies(values) {
+  const base = d3.mean(values.slice(BASELINE[0] - meta.start_year, BASELINE[1] - meta.start_year + 1));
+  return values.map((v) => v - base);
+}
+
+// Fitted line over [a, b] as two endpoints, plus its slope in °C/decade.
+function fitLine(vals, a, b) {
+  const w = vals.slice(a - meta.start_year, b - meta.start_year + 1), n = w.length, tbar = (n - 1) / 2;
+  const slope = d3.sum(w, (v, t) => (t - tbar) * v) / ((n * (n * n - 1)) / 12);   // °C / year
+  const mid = d3.mean(w);
+  return { x1: a, y1: mid - slope * tbar, x2: b, y2: mid + slope * tbar, rate: slope * 10 };
+}
+
+// Yearly SST of one 2° cell (°C), same year range as global_mean_sst.
+function cellValues(c) {
+  const n = meta.global_mean_sst.length, nxc = nx >> 1, nyc = ny >> 1;
+  return Array.from({ length: n }, (_, k) => annual[(k * nyc + c.J) * nxc + c.I] / ANNUAL_SCALE);
+}
+const cellLon = (c) => (meta.x[2 * c.I] + meta.x[2 * c.I + 1]) / 2;
+const cellLat = (c) => (meta.y[2 * c.J] + meta.y[2 * c.J + 1]) / 2;
+const cellLabel = (c) => {
+  const lat = cellLat(c);
+  return `${Math.round(cellLon(c))}°E, ${Math.abs(Math.round(lat))}°${lat < 0 ? "S" : "N"} (2° cell)`;
+};
+
+// Static parts (axes, lines): rebuilt only when the size or the selected cell changes.
+function buildSeries() {
+  if (!meta || !meta.global_mean_sst) return;
+  const svg = d3.select("#series");
+  svg.selectAll("*").remove();
+  const W = svg.node().clientWidth, H = svg.node().clientHeight;
+  const iw = W - SM.left - SM.right, ih = H - SM.top - SM.bottom;
+  const first = meta.start_year, last = meta.years[meta.years.length - 1];
+  const glob = anomalies(meta.global_mean_sst);
+  const main = selCell ? anomalies(cellValues(selCell)) : glob;
+  const ref = selCell ? glob : null;
+
+  const x = d3.scaleLinear([first, last], [0, iw]);
+  const y = d3.scaleLinear(d3.extent([...main, ...(ref || []), 0]), [ih, 0]).nice();
+  const g = svg.append("g").attr("transform", `translate(${SM.left},${SM.top})`);
+
+  g.append("g").attr("class", "axis").attr("transform", `translate(0,${ih})`)
+    .call(d3.axisBottom(x).ticks(iw < 450 ? 4 : 8).tickFormat(d3.format("d")).tickSizeOuter(0));
+  g.append("g").attr("class", "axis")
+    .call(d3.axisLeft(y).ticks(5).tickFormat(d3.format("+.1~f")).tickSizeOuter(0));
+  g.append("text").attr("class", "ylabel").attr("x", -SM.left).attr("y", -SM.top + 2).attr("dy", "0.7em")
+    .text(`°C vs ${BASELINE[0]}–${BASELINE[1]}`);
+  g.append("line").attr("class", "zero").attr("x1", 0).attr("x2", iw).attr("y1", y(0)).attr("y2", y(0));
+
+  // Click or drag anywhere on the plot: the map jumps to that end year.
+  const scrub = (e) => {
+    stop();
+    const yr = Math.max(meta.years[0], Math.min(last, Math.round(x.invert(e.x))));
+    if (yr !== meta.years[state.k]) setYear(yr);
+  };
+  g.append("rect").attr("class", "bg").attr("width", iw).attr("height", ih)
+    .call(d3.drag().on("start", scrub).on("drag", scrub));
+
+  const now = g.append("line").attr("class", "now").attr("y1", 0).attr("y2", ih);
+  const line = d3.line().x((_, k) => x(first + k)).y((v) => y(v));
+  if (ref) g.append("path").attr("class", "line-ref").attr("d", line(ref));
+  g.append("path").attr("class", "line-main").attr("d", line(main));
+  const dots = g.append("g");
+  const fitRef = ref ? g.append("line").attr("class", "fit-ref") : null;
+  const fit = g.append("line").attr("class", "fit");
+
+  // Legend key, right-aligned above the plot.
+  const key = g.append("g").attr("class", "key").attr("transform", `translate(${iw},${-SM.top + 8})`);
+  const items = [[selCell ? "this cell" : "global mean", "line-main"],
+    ...(ref ? [["global mean", "line-ref"]] : []), ["trend 1850 to end year", "fit"]];
+  let kx = 0;
+  items.reverse().forEach(([label, cls]) => {
+    const t = key.append("text").attr("x", kx).attr("dy", "0.32em").attr("text-anchor", "end").text(label);
+    kx -= t.node().getComputedTextLength() + 6;
+    key.append("line").attr("class", cls).attr("x1", kx - 16).attr("x2", kx);
+    kx -= 30;
+  });
+
+  series = { x, y, now, dots, fit, fitRef, main, ref };
+}
+
+// Dynamic parts: end-year marker, dots, fitted line(s), subtitle. Runs on every render.
+function updateSeries() {
+  if (!series) buildSeries();
+  if (!series) return;
+  const { x, y, now, dots, fit, fitRef, main, ref } = series;
+  const a = meta.start_year, b = meta.years[state.k];
+  now.attr("x1", x(b)).attr("x2", x(b));
+
+  const upto = main.map((v, k) => [a + k, v]).filter(([yr]) => yr <= b);
+  dots.selectAll("circle").data(upto).join("circle").attr("class", "dot")
+    .attr("r", 1.5).attr("cx", (d) => x(d[0])).attr("cy", (d) => y(d[1]));
+
+  const f = fitLine(main, a, b);
+  fit.attr("x1", x(f.x1)).attr("y1", y(f.y1)).attr("x2", x(f.x2)).attr("y2", y(f.y2));
+  let sub = `Trend ${a}–${b}: ${d3.format("+.3f")(f.rate)} °C/decade`;
+  if (ref) {
+    const r = fitLine(ref, a, b);
+    fitRef.attr("x1", x(r.x1)).attr("y1", y(r.y1)).attr("x2", x(r.x2)).attr("y2", y(r.y2));
+    sub += ` · global mean ${d3.format("+.3f")(r.rate)} °C/decade`;
+  }
+  document.getElementById("series-sub").textContent = sub;
+}
+
+// ---------- click a map cell ----------
+function selectCell(c) {
+  if (c === selCell) return;
+  selCell = c;
+  document.getElementById("clear-cell").hidden = c === null;
+  document.getElementById("series-title").textContent = c === null ? "Global-mean SST" : `SST near ${cellLabel(c)}`;
+  buildSeries();
+  updateSeries();
+  renderMarker();
+}
+
+function setupSeriesClicks() {
+  const canvas = ctx.canvas;
+  canvas.addEventListener("click", (e) => {
+    if (!annual) return;
+    const r = canvas.getBoundingClientRect();
+    const [bx, by] = transform.invert([e.clientX - r.left, e.clientY - r.top]);   // undo zoom/pan
+    let lon = wrapLon(lonX().invert(bx));
+    if (lon < xEdges[0]) lon += 360;
+    const lat = latY().invert(by);
+    const i = d3.bisectRight(xEdges, lon) - 1, j = d3.bisectRight(yEdges, lat) - 1;
+    let next = null;                                         // land or off-map -> back to global mean
+    if (i >= 0 && i < nx && j >= 0 && j < ny && !Number.isNaN(value(meta.years.length - 1, j, i))) {
+      next = { I: i >> 1, J: j >> 1 };
+      if (selCell && next.I === selCell.I && next.J === selCell.J) next = null;   // same cell again
+    }
+    selectCell(next);
+  });
+  document.getElementById("clear-cell").addEventListener("click", () => selectCell(null));
+}
+
+// Ring on the selected cell. Follows zoom/pan because draw() calls it.
+function renderMarker() {
+  const svg = d3.select("#map-axes");
+  svg.selectAll(".marker-g").remove();
+  if (!selCell || !mapW) return;
+  const t = transform, period = mapW * t.k;                  // one full 360° on screen
+  let sx = t.applyX(lonX()(cellLon(selCell)));
+  sx = ((sx % period) + period) % period;                    // longitude wraps around
+  const sy = t.applyY(latY()(cellLat(selCell)));
+  if (sx > mapW || sy < 0 || sy > mapH) return;              // scrolled out of view
+  const g = svg.append("g").attr("class", "marker-g");
+  g.append("circle").attr("class", "marker-halo").attr("cx", M.left + sx).attr("cy", sy).attr("r", 7);
+  g.append("circle").attr("class", "marker").attr("cx", M.left + sx).attr("cy", sy).attr("r", 7);
 }

@@ -44,6 +44,18 @@
 
     <p class="note" id="note"></p>
 
+    <section class="series">
+      <div class="series-head">
+        <h2 id="series-title">Global-mean SST</h2>
+        <button id="clear-cell" type="button" hidden>Back to global mean</button>
+      </div>
+      <p class="series-sub" id="series-sub"></p>
+      <svg id="series" role="img" aria-label="Annual SST with the fitted trend line from 1850 to the selected end year"></svg>
+      <p class="hint">Click or drag along the chart to move the map to that year · click any ocean cell on the map to see its yearly SST.</p>
+    </section>
+
+
+
     <p class="source"><strong>Data:</strong> MIROC6 historical run (r5i1p1f1), sea-surface temperature (<code>tos</code>), on the model's native grid of about 1°×1° cells.</p>
 
 <p class="source"><strong>Transformations:</strong> Monthly values are averaged into annual means. Land cells are excluded, and the map is cropped to 80°S–63°N, where the model grid lines up with latitude.
