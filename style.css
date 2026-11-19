@@ -204,7 +204,7 @@ input:focus-visible, button:focus-visible {
 
 .source{font-size: 20px;}
 
-.series { margin: 20px 0 64px; }
+.series { margin: 20px 0 40px; }
 .series-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 .series h2 { margin: 0; }
 #clear-cell { font-size: 0.8125rem; padding: 2px 8px; color: var(--text-secondary); }
